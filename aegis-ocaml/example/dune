@@ -1,0 +1,3 @@
+(executable
+ (name main)
+ (libraries aegis_component unix))

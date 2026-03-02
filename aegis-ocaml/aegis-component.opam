@@ -1,0 +1,12 @@
+opam-version: "2.0"
+name:         "aegis-component"
+version:      "0.1.0"
+synopsis:     "OCaml client library for Aegis components"
+depends: [
+  "ocaml"  {>= "5.0"}
+  "dune"   {>= "3.12"}
+  "yojson" {>= "2.0"}
+  "uuidm"
+  "threads" {>= "0.1"}
+]
+build: [["dune" "build" "-p" name "-j" jobs]]

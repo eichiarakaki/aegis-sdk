@@ -1,0 +1,3 @@
+(library
+ (name aegis_component)
+ (libraries unix yojson uuidm))
