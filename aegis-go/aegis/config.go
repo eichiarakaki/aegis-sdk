@@ -2,6 +2,7 @@ package aegis
 
 import (
 	"context"
+	"os"
 	"time"
 )
 
@@ -10,31 +11,45 @@ type Config struct {
 	// Connection
 	SocketPath string
 
-	// Identity
+	// Identity — if empty, read from AEGIS_* environment variables injected
+	// by aegisd when the component is launched via SESSION_ATTACH.
 	SessionToken  string
+	ComponentID   string // pre-assigned by aegisd; sent in REGISTER
 	ComponentName string
 	Version       string
 
 	// Capabilities
 	SupportedSymbols    []string
 	SupportedTimeframes []string
-	RequiresStreams      []string
+	RequiresStreams     []string
 
 	// Reconnection
-	Reconnect             bool
-	ReconnectDelay        time.Duration
-	MaxReconnectDelay     time.Duration
-	MaxReconnectAttempts  int // 0 = unlimited
+	Reconnect            bool
+	ReconnectDelay       time.Duration
+	MaxReconnectDelay    time.Duration
+	MaxReconnectAttempts int // 0 = unlimited
 
 	// Logging
 	Logger Logger
 }
 
-// DefaultConfig returns a Config with sensible reconnection defaults.
-func DefaultConfig(socketPath, sessionToken, componentName string) Config {
+// DefaultConfig returns a Config populated from AEGIS_* environment variables
+// with sensible reconnection defaults. All values can be overridden after the call.
+//
+// Environment variables injected by aegisd at launch:
+//
+//	AEGIS_SOCKET        — components Unix socket path
+//	AEGIS_SESSION_TOKEN — session ID used as registration token
+//	AEGIS_COMPONENT_ID  — pre-assigned component ID
+func DefaultConfig(componentName string) Config {
+	socketPath := envOr("AEGIS_SOCKET", "/tmp/aegis-components.sock")
+	sessionToken := envOr("AEGIS_SESSION_TOKEN", "")
+	componentID := envOr("AEGIS_COMPONENT_ID", "")
+
 	return Config{
 		SocketPath:           socketPath,
 		SessionToken:         sessionToken,
+		ComponentID:          componentID,
 		ComponentName:        componentName,
 		Version:              "0.1.0",
 		Reconnect:            true,
@@ -43,6 +58,13 @@ func DefaultConfig(socketPath, sessionToken, componentName string) Config {
 		MaxReconnectAttempts: 0,
 		Logger:               NewDefaultLogger(componentName),
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // Handlers groups all event callbacks for a component.
