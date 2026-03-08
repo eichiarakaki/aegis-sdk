@@ -1,0 +1,15 @@
+
+Currently working SDKs
+----------------------
+- Rust SDK
+- Go SDK
+
+Outdated SDKs
+-------------
+- Ocaml
+- Python
+- C++
+
+Notes
+------
+- The BookDepth data is cumulative from the price.
