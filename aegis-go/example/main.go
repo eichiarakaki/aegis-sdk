@@ -2,89 +2,102 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	aegis "github.com/eichiarakaki/aegis-component-go"
+	aegis "github.com/eichiarakaki/aegis-sdk/aegis-go/aegis"
 )
 
 func main() {
-	cfg := aegis.DefaultConfig(
-		"/tmp/aegis_components.sock",
-		"YOUR_SESSION_TOKEN_HERE",
-		"market_data",
-	)
-	cfg.Version              = "0.1.0"
-	cfg.SupportedSymbols    = []string{"BTC/USDT", "ETH/USDT"}
-	cfg.SupportedTimeframes = []string{"1m", "5m"}
-	cfg.RequiresStreams      = []string{"candles"}
+	cfg := aegis.DefaultConfig("market_data")
+	cfg.Version = "0.1.0"
+	cfg.SupportedSymbols = []string{"BTCUSDT", "ETHUSDT"}
+	cfg.SupportedTimeframes = []string{"1m", "5m", "15m"}
+	cfg.RequiresStreams = []string{"klines", "trades"}
 	cfg.MaxReconnectAttempts = 10
 
-	// Use a cancelable context — cancelling it triggers a graceful shutdown.
+	component := aegis.New(cfg, aegis.Handlers{})
+	log := cfg.Logger
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// worker holds the running goroutine so OnShutdown can stop it.
 	var workerCancel context.CancelFunc
+	var socketPath string
 
-	handlers := aegis.Handlers{
-		OnConfigure: func(ctx context.Context, socketPath string, topics []string) error {
-			log.Printf("Configuring — socket=%s topics=%v", socketPath, topics)
-			// In a real component, connect to the data stream here:
-			// conn, err := net.Dial("unix", socketPath)
-			return nil
-		},
-
-		OnRunning: func(ctx context.Context) error {
-			workerCtx, wcancel := context.WithCancel(ctx)
-			workerCancel = wcancel
-			go dataWorker(workerCtx)
-			return nil
-		},
-
-		OnPing: func(ctx context.Context) {
-			log.Println("PING received")
-		},
-
-		OnShutdown: func(ctx context.Context) {
-			log.Println("Shutdown hook — releasing resources")
-			if workerCancel != nil {
-				workerCancel()
-			}
-		},
-
-		OnError: func(ctx context.Context, code, message string) {
-			log.Printf("Error from Aegis — code=%s message=%s", code, message)
-		},
+	component.Handlers().OnConfigure = func(ctx context.Context, sp string, topics []string) error {
+		socketPath = sp
+		log.Infof("Configuring — socket=%s topics=%v", sp, topics)
+		return nil
 	}
 
-	component := aegis.New(cfg, handlers)
+	component.Handlers().OnRunning = func(ctx context.Context) error {
+		workerCtx, wcancel := context.WithCancel(ctx)
+		workerCancel = wcancel
+		go streamWorker(workerCtx, component, socketPath, log)
+		return nil
+	}
 
-	log.Println("Starting market_data component...")
+	component.Handlers().OnShutdown = func(ctx context.Context) {
+		log.Infof("Shutdown — releasing resources")
+		if workerCancel != nil {
+			workerCancel()
+		}
+	}
+
+	component.Handlers().OnError = func(ctx context.Context, code, message string) {
+		log.Errorf("Error from Aegis — code=%s message=%s", code, message)
+	}
+
+	log.Infof("Starting market_data component...")
 	if err := component.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "component stopped: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// dataWorker simulates processing market data ticks.
-func dataWorker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+func streamWorker(ctx context.Context, c *aegis.Component, socketPath string, log aegis.Logger) {
+	if socketPath == "" {
+		log.Errorf("No socket path received — cannot open stream")
+		return
+	}
 
-	tick := 0
+	var stream *aegis.DataStream
 	for {
+		var err error
+		stream, err = c.OpenStream(ctx, socketPath)
+		if err == nil {
+			break
+		}
+		log.Warnf("Stream connect error: %v — retrying in 1s...", err)
 		select {
 		case <-ctx.Done():
-			log.Println("Data worker stopped")
 			return
-		case <-ticker.C:
-			tick++
-			log.Printf("Tick #%d — processing data...", tick)
+		case <-time.After(time.Second):
 		}
 	}
+	defer stream.Close()
+
+	log.Infof("Stream opened successfully — subscribed to: %v", stream.Topics)
+
+	for {
+		msg, err := stream.Next(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Errorf("Stream read error: %v", err)
+			return
+		}
+		handleMessage(msg, log)
+	}
+}
+
+func handleMessage(msg *aegis.StreamEnvelope, log aegis.Logger) {
+	raw, _ := json.MarshalIndent(msg, "", "  ")
+	log.Infof("Received — topic=%s ts=%d\n%s", msg.Topic, msg.Ts, string(raw))
 }

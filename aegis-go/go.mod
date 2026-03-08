@@ -1,4 +1,4 @@
-module github.com/eichiarakaki/aegis-component-go
+module github.com/eichiarakaki/aegis-sdk/aegis-go
 
 go 1.22
 

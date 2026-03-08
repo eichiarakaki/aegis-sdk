@@ -23,9 +23,9 @@ type Component struct {
 	SessionID   string
 	State       atomic.Value // ComponentState
 
-	conn    net.Conn
-	reader  *bufio.Reader
-	sendMu  sync.Mutex
+	conn   net.Conn
+	reader *bufio.Reader
+	sendMu sync.Mutex
 
 	startedAt time.Time
 	log       Logger
@@ -50,7 +50,7 @@ func New(cfg Config, handlers Handlers) *Component {
 // Reconnection is handled automatically if cfg.Reconnect is true.
 func (c *Component) Run(ctx context.Context) error {
 	attempts := 0
-	delay    := c.cfg.ReconnectDelay
+	delay := c.cfg.ReconnectDelay
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -59,12 +59,10 @@ func (c *Component) Run(ctx context.Context) error {
 
 		runErr := c.runOnce(ctx)
 
-		// Context cancelled — clean exit
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 			return runErr
 		}
 
-		// Registration errors are fatal
 		var regErr *RegistrationError
 		if errors.As(runErr, &regErr) {
 			return runErr
@@ -87,7 +85,7 @@ func (c *Component) Run(ctx context.Context) error {
 		case <-time.After(delay):
 		}
 
-		delay = min(delay*2, c.cfg.MaxReconnectDelay)
+		delay = minDuration(delay*2, c.cfg.MaxReconnectDelay)
 	}
 }
 
@@ -120,6 +118,12 @@ func (c *Component) CurrentState() ComponentState {
 	return c.State.Load().(ComponentState)
 }
 
+// Handlers returns a pointer to the component's handler set so callers
+// can override individual callbacks after New() but before Run().
+func (c *Component) Handlers() *Handlers {
+	return &c.handlers
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
@@ -127,31 +131,34 @@ func (c *Component) CurrentState() ComponentState {
 func (c *Component) runOnce(ctx context.Context) error {
 	c.startedAt = time.Now()
 
-	// Connect
 	c.log.Infof("Connecting to %s", c.cfg.SocketPath)
 	conn, err := net.Dial("unix", c.cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	c.conn   = conn
+	c.conn = conn
 	c.reader = bufio.NewReader(conn)
 	defer c.closeConn()
 
 	c.log.Infof("Connected")
 
-	// Register
-	if err := c.register(); err != nil {
+	// Handshake: REGISTER → REGISTERED → STATE_UPDATE(INITIALIZING) → STATE_UPDATE(READY) → CONFIGURE → ACK → RUNNING
+	if err := c.register(ctx); err != nil {
 		return err
 	}
 
-	// Message loop
 	return c.messageLoop(ctx)
 }
 
-func (c *Component) register() error {
+// register executes the full handshake sequence:
+//  1. Send REGISTER (with pre-assigned component_id if available)
+//  2. Receive REGISTERED
+//  3. Send STATE_UPDATE(READY) — signals aegisd to send CONFIGURE
+func (c *Component) register(ctx context.Context) error {
 	env := newEnvelope(MessageTypeLifecycle, CommandRegister, c.source(), map[string]interface{}{
 		"session_token":  c.cfg.SessionToken,
 		"component_name": c.cfg.ComponentName,
+		"component_id":   c.cfg.ComponentID, // empty string is fine — daemon generates one if missing
 		"version":        c.cfg.Version,
 		"capabilities": map[string]interface{}{
 			"supported_symbols":    c.cfg.SupportedSymbols,
@@ -168,16 +175,40 @@ func (c *Component) register() error {
 	if err != nil {
 		return fmt.Errorf("recv registered: %w", err)
 	}
-
 	if resp.Command != CommandRegistered {
-		return &RegistrationError{Msg: fmt.Sprintf("unexpected response command: %s", resp.Command)}
+		return &RegistrationError{Msg: fmt.Sprintf("unexpected response: %s", resp.Command)}
 	}
 
 	c.ComponentID = fmt.Sprintf("%v", resp.Payload["component_id"])
-	c.SessionID   = fmt.Sprintf("%v", resp.Payload["session_id"])
+	c.SessionID = fmt.Sprintf("%v", resp.Payload["session_id"])
 	c.State.Store(StateRegistered)
-
 	c.log.Infof("Registered — component_id=%s session_id=%s", c.ComponentID, c.SessionID)
+
+	// INITIALIZING — component performs its own startup work (load models, open files, etc.)
+	// aegisd WaitForReady expects this state before READY.
+	if err := c.SendStateUpdate(ctx, StateInitializing, ""); err != nil {
+		return fmt.Errorf("send STATE_UPDATE(INITIALIZING): %w", err)
+	}
+	c.log.Debugf("Sent STATE_UPDATE(INITIALIZING)")
+
+	// Wait for ACK from aegisd before advancing to READY.
+	if _, err := c.recv(); err != nil {
+		return fmt.Errorf("recv ACK(INITIALIZING): %w", err)
+	}
+	c.log.Debugf("ACK(INITIALIZING) received")
+
+	// READY — signals aegisd to proceed with CONFIGURE.
+	if err := c.SendStateUpdate(ctx, StateReady, ""); err != nil {
+		return fmt.Errorf("send STATE_UPDATE(READY): %w", err)
+	}
+	c.log.Debugf("Sent STATE_UPDATE(READY) — waiting for CONFIGURE")
+
+	// Wait for ACK from aegisd — CONFIGURE follows immediately after.
+	if _, err := c.recv(); err != nil {
+		return fmt.Errorf("recv ACK(READY): %w", err)
+	}
+	c.log.Debugf("ACK(READY) received")
+
 	return nil
 }
 
@@ -185,7 +216,6 @@ func (c *Component) messageLoop(ctx context.Context) error {
 	c.log.Debugf("Entering message loop")
 
 	for {
-		// Check context before blocking on read
 		if err := ctx.Err(); err != nil {
 			_ = c.gracefulShutdown(ctx)
 			return err
@@ -241,6 +271,12 @@ func (c *Component) handleHeartbeat(ctx context.Context, env *Envelope) {
 	c.log.Debugf("Sent PONG (uptime=%ds)", uptime)
 }
 
+// handleConfig processes CONFIGURE from aegisd:
+//  1. Call OnConfigure handler
+//  2. ACK the message
+//  3. Send STATE_UPDATE(CONFIGURED) — aegisd waits for this before proceeding
+//  4. Send STATE_UPDATE(RUNNING)
+//  5. Call OnRunning handler in a goroutine
 func (c *Component) handleConfig(ctx context.Context, env *Envelope) {
 	if env.Command != CommandConfigure {
 		return
@@ -265,9 +301,30 @@ func (c *Component) handleConfig(ctx context.Context, env *Envelope) {
 		}
 	}
 
+	// ACK the CONFIGURE message — aegisd WaitForConfigACK expects this.
 	_ = c.sendACK(env.MessageID)
-	_ = c.SendStateUpdate(ctx, StateConfigured, "")
-	_ = c.SendStateUpdate(ctx, StateRunning, "")
+
+	// STATE_UPDATE(CONFIGURED) — wait for ACK before advancing.
+	if err := c.SendStateUpdate(ctx, StateConfigured, ""); err != nil {
+		c.log.Errorf("Failed to send STATE_UPDATE(CONFIGURED): %v", err)
+		return
+	}
+	if _, err := c.recv(); err != nil {
+		c.log.Errorf("Failed to recv ACK(CONFIGURED): %v", err)
+		return
+	}
+	c.log.Debugf("ACK(CONFIGURED) received")
+
+	// STATE_UPDATE(RUNNING) — wait for ACK before entering message loop.
+	if err := c.SendStateUpdate(ctx, StateRunning, ""); err != nil {
+		c.log.Errorf("Failed to send STATE_UPDATE(RUNNING): %v", err)
+		return
+	}
+	if _, err := c.recv(); err != nil {
+		c.log.Errorf("Failed to recv ACK(RUNNING): %v", err)
+		return
+	}
+	c.log.Debugf("ACK(RUNNING) received")
 
 	c.log.Infof("Component is now RUNNING")
 
@@ -298,7 +355,7 @@ func (c *Component) handleLifecycle(ctx context.Context, env *Envelope) bool {
 
 // handleErrorMsg returns true if the error is non-recoverable.
 func (c *Component) handleErrorMsg(ctx context.Context, env *Envelope) bool {
-	code, _    := env.Payload["code"].(string)
+	code, _ := env.Payload["code"].(string)
 	message, _ := env.Payload["message"].(string)
 	recoverable, _ := env.Payload["recoverable"].(bool)
 
@@ -353,10 +410,13 @@ func (c *Component) closeConn() {
 }
 
 func (c *Component) source() string {
+	if c.ComponentID != "" {
+		return "component:" + c.ComponentID
+	}
 	return "component:" + c.cfg.ComponentName
 }
 
-func min(a, b time.Duration) time.Duration {
+func minDuration(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
 	}
@@ -367,7 +427,7 @@ func min(a, b time.Duration) time.Duration {
 // Errors
 // ---------------------------------------------------------------------------
 
-// RegistrationError is returned when the Aegis handshake fails.
+// RegistrationError is returned when the Aegis handshake fails fatally.
 // The component will not retry after this error.
 type RegistrationError struct {
 	Msg string

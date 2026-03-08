@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any, Optional
 
 
-PROTOCOL_VERSION = "0.1"
+PROTOCOL_VERSION = "0.1.0"
 
 
 class MessageType(str, Enum):
@@ -23,16 +23,16 @@ class MessageType(str, Enum):
 
 
 class Command(str, Enum):
-    REGISTER    = "REGISTER"
-    REGISTERED  = "REGISTERED"
-    STATE_UPDATE = "STATE_UPDATE"
-    SHUTDOWN    = "SHUTDOWN"
-    ACK         = "ACK"
-    NACK        = "NACK"
-    CONFIGURE   = "CONFIGURE"
-    CONFIGURED  = "CONFIGURED"
-    PING        = "PING"
-    PONG        = "PONG"
+    REGISTER            = "REGISTER"
+    REGISTERED          = "REGISTERED"
+    STATE_UPDATE        = "STATE_UPDATE"
+    SHUTDOWN            = "SHUTDOWN"
+    ACK                 = "ACK"
+    NACK                = "NACK"
+    CONFIGURE           = "CONFIGURE"
+    CONFIGURED          = "CONFIGURED"
+    PING                = "PING"
+    PONG                = "PONG"
     RUNTIME_ERROR       = "RUNTIME_ERROR"
     REGISTRATION_FAILED = "REGISTRATION_FAILED"
 
@@ -56,6 +56,7 @@ def new_envelope(
     source: str,
     payload: dict[str, Any],
     correlation_id: Optional[str] = None,
+    target: str = "aegis",
 ) -> dict[str, Any]:
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -63,7 +64,7 @@ def new_envelope(
         "correlation_id":   correlation_id,
         "timestamp":        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source":           source,
-        "target":           "aegis",
+        "target":           target,
         "type":             msg_type.value,
         "command":          command.value,
         "payload":          payload,
