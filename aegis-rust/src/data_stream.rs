@@ -1,10 +1,11 @@
 //! DataStream — client for the Aegis data stream Unix socket.
 //!
-//! The orchestrator publishes market data as newline-delimited JSON frames:
+//! The orchestrator publishes market data as newline-delimited JSON frames
+//! delivered over a Unix socket. The component must complete a handshake
+//! before data starts flowing:
 //!
-//! ```json
-//! {"topic": "aggTrades.BTCUSDT", "data": { ... }}
-//! ```
+//!   Component → {"component_id": "...", "session_token": "<session_id>"}
+//!   Server    → {"status": "ok", "topics": [...]}
 //!
 //! Usage:
 //! ```rust
@@ -17,10 +18,10 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     time::timeout,
 };
@@ -32,23 +33,22 @@ use crate::error::{AegisError, Result};
 /// A single message received from the data stream.
 #[derive(Debug, Clone)]
 pub struct StreamMessage {
-    /// Dot-separated topic, e.g. `"aggTrades.BTCUSDT"` or
-    /// `"klines.BTCUSDT.1h"`.
+    /// Dot-separated topic, e.g. `"aggTrades.BTCUSDT"` or `"klines.BTCUSDT.1h"`.
     pub topic: String,
     /// Raw JSON payload — shape depends on the topic.
-    pub data:  Value,
+    pub data: Value,
 }
 
 /// Connected data stream session.
 pub struct DataStream {
     /// Topics this stream is subscribed to (from the handshake response).
     pub topics: Vec<String>,
-    reader:     BufReader<tokio::net::unix::OwnedReadHalf>,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
 }
 
 // ─── Wire format ──────────────────────────────────────────────────────────────
 
-/// Frame sent by the orchestrator.
+/// Incoming data frame from the orchestrator.
 #[derive(Debug, Deserialize)]
 struct Frame {
     topic: String,
@@ -56,16 +56,19 @@ struct Frame {
 }
 
 /// Handshake sent by the component to identify itself.
-#[derive(serde::Serialize)]
-struct Hello<'a> {
-    component_id: &'a str,
-    session_id:   &'a str,
+/// `session_token` is the session ID (not the registration token).
+#[derive(Serialize)]
+struct Handshake<'a> {
+    component_id:  &'a str,
+    session_token: &'a str,
 }
 
-/// Handshake response from the orchestrator.
+/// Handshake response from the data stream server.
 #[derive(Deserialize)]
-struct Welcome {
-    topics: Vec<String>,
+struct HandshakeResponse {
+    status:  String,
+    message: Option<String>,
+    topics:  Option<Vec<String>>,
 }
 
 // ─── Read timeout ─────────────────────────────────────────────────────────────
@@ -78,12 +81,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl DataStream {
-    /// Connect to the data stream socket, send a HELLO, and wait for WELCOME.
+    /// Connect to the data stream socket and complete the handshake.
     ///
-    /// `socket_path` — path to the Unix socket the orchestrator is listening on,
-    ///                 typically `/tmp/aegis-data-stream-<session_id>.sock`.
-    /// `component_id` / `session_id` — from env vars `AEGIS_COMPONENT_ID` and
-    ///                                  `AEGIS_SESSION_TOKEN`.
+    /// `socket_path`  — from the CONFIGURE payload (`data_stream_socket`).
+    /// `component_id` — from env var `AEGIS_COMPONENT_ID` or the stored ID
+    ///                  received in the REGISTERED response.
+    /// `session_id`   — the session ID received in the REGISTERED response
+    ///                  (used as `session_token` in the handshake).
     pub async fn connect(
         socket_path:  &str,
         component_id: &str,
@@ -96,37 +100,37 @@ impl DataStream {
         let mut writer = tokio::io::BufWriter::new(write_half);
         let mut reader = BufReader::new(read_half);
 
-        // Send HELLO so the orchestrator knows which component is subscribing.
-        let hello = Hello { component_id, session_id };
-        let mut frame = serde_json::to_string(&hello)
-            .map_err(AegisError::Json)?;
+        // Send handshake so the server can identify this component and
+        // build its topic subscription set.
+        let hs = Handshake { component_id, session_token: session_id };
+        let mut frame = serde_json::to_string(&hs).map_err(AegisError::Json)?;
         frame.push('\n');
 
-        use tokio::io::AsyncWriteExt;
-        writer.write_all(frame.as_bytes()).await
-            .map_err(AegisError::Io)?;
-        writer.flush().await
-            .map_err(AegisError::Io)?;
+        writer.write_all(frame.as_bytes()).await.map_err(AegisError::Io)?;
+        writer.flush().await.map_err(AegisError::Io)?;
 
-        // Read WELCOME — contains the topic list for this component.
+        // Read handshake response — contains the topic list and status.
         let mut line = String::new();
         timeout(Duration::from_secs(10), reader.read_line(&mut line))
             .await
             .map_err(|_| AegisError::Timeout)?
             .map_err(AegisError::Io)?;
 
-        let welcome: Welcome = serde_json::from_str(&line)
-            .map_err(|e| AegisError::Connection(format!("data stream welcome: {e}")))?;
+        let resp: HandshakeResponse = serde_json::from_str(&line)
+            .map_err(|e| AegisError::Connection(format!("data stream handshake response: {e}")))?;
 
-        tracing::debug!(
-            topics = ?welcome.topics,
-            "data stream connected"
-        );
+        if resp.status != "ok" {
+            return Err(AegisError::Connection(format!(
+                "data stream handshake rejected: {}",
+                resp.message.unwrap_or_else(|| "no message".into())
+            )));
+        }
 
-        Ok(Self {
-            topics: welcome.topics,
-            reader,
-        })
+        let topics = resp.topics.unwrap_or_default();
+
+        tracing::debug!(?topics, "data stream connected");
+
+        Ok(Self { topics, reader })
     }
 
     /// Read the next message from the stream.
@@ -146,8 +150,7 @@ impl DataStream {
             return Err(AegisError::Connection("data stream closed".into()));
         }
 
-        let frame: Frame = serde_json::from_str(&line)
-            .map_err(AegisError::Json)?;
+        let frame: Frame = serde_json::from_str(&line).map_err(AegisError::Json)?;
 
         Ok(StreamMessage {
             topic: frame.topic,

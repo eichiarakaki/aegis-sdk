@@ -27,6 +27,7 @@ use crate::{
 #[allow(unused_variables)]
 pub trait ComponentHandler: Send + Sync + 'static {
     /// Called when Aegis sends a CONFIGURE message.
+    /// `socket_path` and `topics` come directly from the CONFIGURE payload.
     fn on_configure(
         &self,
         socket_path: String,
@@ -151,7 +152,12 @@ impl<H: ComponentHandler> Component<H> {
         if let Some(msg) = message {
             payload.insert("message".into(), Value::String(msg.to_string()));
         }
-        let env = Envelope::new(MessageType::Lifecycle, Command::StateUpdate, self.source(), payload);
+        let env = Envelope::new(
+            MessageType::Lifecycle,
+            Command::StateUpdate,
+            self.source(),
+            payload,
+        );
         self.send_envelope(writer, &env).await?;
         *self.state.lock().await = new_state;
         Ok(())
@@ -168,7 +174,12 @@ impl<H: ComponentHandler> Component<H> {
         payload.insert("code".into(),        Value::String(code.to_string()));
         payload.insert("message".into(),     Value::String(message.to_string()));
         payload.insert("recoverable".into(), Value::Bool(recoverable));
-        let env = Envelope::new(MessageType::Error, Command::RuntimeError, self.source(), payload);
+        let env = Envelope::new(
+            MessageType::Error,
+            Command::RuntimeError,
+            self.source(),
+            payload,
+        );
         self.send_envelope(writer, &env).await
     }
 
@@ -194,14 +205,24 @@ impl<H: ComponentHandler> Component<H> {
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
         reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     ) -> Result<()> {
+        // Build REGISTER payload
         let mut payload = HashMap::new();
         payload.insert("session_token".into(),  Value::String(self.cfg.session_token.clone()));
         payload.insert("component_name".into(), Value::String(self.cfg.component_name.clone()));
         payload.insert("version".into(),        Value::String(self.cfg.version.clone()));
 
+        // Prefer the internally stored ID (set after first REGISTERED response).
+        // On the very first connect it will be empty — fall back to the env var
+        // that LaunchComponents injects so Aegis can match the pre-assigned
+        // placeholder in the registry (Case A in manager.go).
         let stored_id = self.component_id.lock().await.clone();
-        if !stored_id.is_empty() {
-            payload.insert("component_id".into(), Value::String(stored_id));
+        let component_id = if !stored_id.is_empty() {
+            stored_id
+        } else {
+            std::env::var("AEGIS_COMPONENT_ID").unwrap_or_default()
+        };
+        if !component_id.is_empty() {
+            payload.insert("component_id".into(), Value::String(component_id));
         }
 
         payload.insert("capabilities".into(), serde_json::json!({
@@ -210,9 +231,15 @@ impl<H: ComponentHandler> Component<H> {
             "requires_streams":     self.cfg.requires_streams,
         }));
 
-        let env = Envelope::new(MessageType::Lifecycle, Command::Register, self.source(), payload);
+        let env = Envelope::new(
+            MessageType::Lifecycle,
+            Command::Register,
+            self.source(),
+            payload,
+        );
         self.send_envelope(writer, &env).await?;
 
+        // Wait for REGISTERED
         let resp = self.recv_envelope(reader).await?;
         if resp.command != Command::Registered {
             return Err(AegisError::Registration(format!(
@@ -236,6 +263,12 @@ impl<H: ComponentHandler> Component<H> {
             self.component_id.lock().await,
             self.session_id.lock().await,
         );
+
+        // Aegis (WaitForReady) expects STATE_UPDATE(INITIALIZING) then
+        // STATE_UPDATE(READY) before it sends CONFIGURE.
+        self.send_state_update(writer, ComponentState::Initializing, None).await?;
+        self.send_state_update(writer, ComponentState::Ready, None).await?;
+
         Ok(())
     }
 
@@ -276,6 +309,11 @@ impl<H: ComponentHandler> Component<H> {
                         return Err(AegisError::Connection("non-recoverable error".into()));
                     }
                 }
+                // ACKs sent by Aegis in response to STATE_UPDATEs arrive as
+                // Control/Ack — silently ignore them.
+                MessageType::Control => {
+                    debug!("Control/{:?} — ignored", env.command);
+                }
                 _ => warn!("Unknown message type: {:?}", env.msg_type),
             }
         }
@@ -296,8 +334,14 @@ impl<H: ComponentHandler> Component<H> {
         payload.insert("state".into(),          Value::String(format!("{}", *self.state.lock().await)));
         payload.insert("uptime_seconds".into(), Value::Number(uptime.into()));
 
-        let pong = Envelope::new(MessageType::Heartbeat, Command::Pong, self.source(), payload)
-            .with_correlation(env.message_id.clone());
+        let pong = Envelope::new(
+            MessageType::Heartbeat,
+            Command::Pong,
+            self.source(),
+            payload,
+        )
+        .with_correlation(env.message_id.clone());
+
         self.send_envelope(writer, &pong).await?;
         debug!("Sent PONG (uptime={}s)", uptime);
         Ok(())
@@ -313,7 +357,7 @@ impl<H: ComponentHandler> Component<H> {
             return Ok(());
         }
 
-        let sock = env.payload.get("data_stream_socket")
+        let socket_path = env.payload.get("data_stream_socket")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
@@ -323,16 +367,21 @@ impl<H: ComponentHandler> Component<H> {
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        info!("Configuring — socket={} topics={:?}", sock, topics);
+        info!("Configuring — socket={} topics={:?}", socket_path, topics);
 
-        if let Err(e) = self.handler.on_configure(sock, topics).await {
+        if let Err(e) = self.handler.on_configure(socket_path, topics).await {
             error!("on_configure error: {}", e);
             self.send_error(writer, "CONFIGURE_FAILED", &e.to_string(), true).await?;
             return Ok(());
         }
 
+        // 1. ACK the CONFIGURE message
         self.send_ack(writer, &env.message_id).await?;
+
+        // 2. Transition to CONFIGURED — Aegis ACKs via handleLifecycleMessage
         self.send_state_update(writer, ComponentState::Configured, None).await?;
+
+        // 3. Transition to RUNNING
         self.send_state_update(writer, ComponentState::Running, None).await?;
 
         info!("Component is now RUNNING");
@@ -357,10 +406,9 @@ impl<H: ComponentHandler> Component<H> {
             Command::Reborn => {
                 info!("REBORN — clearing state for session restart");
 
-                // on_running keeps running — it will receive data from the
-                // new orchestrator run on the same stream socket.
+                // on_running keeps running — it will receive fresh data from
+                // the orchestrator on the existing stream socket.
                 self.handler.on_reborn().await;
-
                 self.send_ack(writer, &env.message_id).await?;
 
                 info!("REBORN complete — continuing");
@@ -371,7 +419,7 @@ impl<H: ComponentHandler> Component<H> {
                 info!("Shutdown requested by Aegis");
                 shutdown_token.cancel();
                 self.send_ack(writer, &env.message_id).await?;
-                self.graceful_shutdown(writer).await;
+                self.graceful_shutdown().await;
                 Ok(LifecycleOutcome::Stop)
             }
 
@@ -388,28 +436,28 @@ impl<H: ComponentHandler> Component<H> {
     }
 
     async fn handle_error_msg(&self, env: &Envelope) -> bool {
-        let code        = env.payload.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-        let message     = env.payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let recoverable = env.payload.get("recoverable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let code = env.payload.get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        let message = env.payload.get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let recoverable = env.payload.get("recoverable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         error!("Error from Aegis — code={} message={}", code, message);
         self.handler.on_error(code.to_string(), message.to_string()).await;
-        !recoverable
+        !recoverable // true = fatal, triggers reconnect
     }
 
-    async fn graceful_shutdown(&self, writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>) {
+    async fn graceful_shutdown(&self) {
         info!("Shutting down...");
         self.handler.on_shutdown().await;
-
-        let env = Envelope::new(
-            MessageType::Lifecycle,
-            Command::Shutdown,
-            self.source(),
-            HashMap::new(),
-        );
-        let _ = self.send_envelope(writer, &env).await;
         *self.state.lock().await = ComponentState::Shutdown;
         info!("Shutdown complete");
+        // Connection closes naturally when run_once returns, giving the
+        // server a clean EOF instead of an abrupt disconnect.
     }
 
     async fn send_ack(
@@ -419,8 +467,13 @@ impl<H: ComponentHandler> Component<H> {
     ) -> Result<()> {
         let mut payload = HashMap::new();
         payload.insert("status".into(), Value::String("ok".into()));
-        let env = Envelope::new(MessageType::Control, Command::Ack, self.source(), payload)
-            .with_correlation(correlation_id.to_string());
+        let env = Envelope::new(
+            MessageType::Control,
+            Command::Ack,
+            self.source(),
+            payload,
+        )
+        .with_correlation(correlation_id.to_string());
         self.send_envelope(writer, &env).await
     }
 
