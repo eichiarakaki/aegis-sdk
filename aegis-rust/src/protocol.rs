@@ -23,6 +23,7 @@ pub enum Command {
     Registered,
     StateUpdate,
     Shutdown,
+    Reborn,
     Ack,
     Nack,
     Configure,
