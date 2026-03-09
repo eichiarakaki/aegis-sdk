@@ -11,6 +11,7 @@ use tokio::{
     sync::Mutex,
     time::sleep,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -23,8 +24,6 @@ use crate::{
 // ComponentHandler trait
 // ---------------------------------------------------------------------------
 
-/// Implement this trait to define your component's behaviour.
-/// All methods are async and have default no-op implementations.
 #[allow(unused_variables)]
 pub trait ComponentHandler: Send + Sync + 'static {
     /// Called when Aegis sends a CONFIGURE message.
@@ -37,12 +36,25 @@ pub trait ComponentHandler: Send + Sync + 'static {
     }
 
     /// Called after the component transitions to RUNNING.
-    /// Start long-running tasks here (they should respect the passed token).
+    ///
+    /// Start your main processing loop here. The `shutdown` token is
+    /// cancelled only on SHUTDOWN. On a session restart Aegis sends REBORN
+    /// instead — `on_running` keeps going without interruption. Reset
+    /// per-run state in `on_reborn`.
     fn on_running(
         &self,
-        shutdown: tokio::sync::CancellationToken,
+        shutdown: CancellationToken,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         async { Ok(()) }
+    }
+
+    /// Called when Aegis sends REBORN — the session is restarting.
+    ///
+    /// Reset ALL internal state from the previous run (positions, POCs,
+    /// buffers, counters…). After this returns the SDK sends ACK and the
+    /// component stays RUNNING — no reconnect, no new CONFIGURE.
+    fn on_reborn(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
     }
 
     /// Called on every PING before the PONG is sent.
@@ -69,9 +81,6 @@ pub trait ComponentHandler: Send + Sync + 'static {
 // Component
 // ---------------------------------------------------------------------------
 
-/// Aegis component client.
-///
-/// Create with [`Component::new`], then call [`Component::run`].
 pub struct Component<H: ComponentHandler> {
     cfg:     Config,
     handler: Arc<H>,
@@ -95,8 +104,6 @@ impl<H: ComponentHandler> Component<H> {
         }
     }
 
-    /// Connect, register, and run the message loop.
-    /// Reconnects automatically if `cfg.reconnect` is true.
     pub async fn run(&self) -> Result<()> {
         let mut attempts: u32 = 0;
         let mut delay = self.cfg.reconnect_delay;
@@ -110,9 +117,7 @@ impl<H: ComponentHandler> Component<H> {
                     return Err(AegisError::Registration(msg));
                 }
 
-                Err(e) => {
-                    warn!("Disconnected: {}", e);
-                }
+                Err(e) => warn!("Disconnected: {}", e),
             }
 
             if !self.cfg.reconnect {
@@ -135,7 +140,6 @@ impl<H: ComponentHandler> Component<H> {
         }
     }
 
-    /// Send a STATE_UPDATE to Aegis.
     pub async fn send_state_update(
         &self,
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -153,7 +157,6 @@ impl<H: ComponentHandler> Component<H> {
         Ok(())
     }
 
-    /// Report a runtime error to Aegis.
     pub async fn send_error(
         &self,
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -195,6 +198,12 @@ impl<H: ComponentHandler> Component<H> {
         payload.insert("session_token".into(),  Value::String(self.cfg.session_token.clone()));
         payload.insert("component_name".into(), Value::String(self.cfg.component_name.clone()));
         payload.insert("version".into(),        Value::String(self.cfg.version.clone()));
+
+        let stored_id = self.component_id.lock().await.clone();
+        if !stored_id.is_empty() {
+            payload.insert("component_id".into(), Value::String(stored_id));
+        }
+
         payload.insert("capabilities".into(), serde_json::json!({
             "supported_symbols":    self.cfg.supported_symbols,
             "supported_timeframes": self.cfg.supported_timeframes,
@@ -235,7 +244,9 @@ impl<H: ComponentHandler> Component<H> {
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
         reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     ) -> Result<()> {
-        let shutdown_token = tokio::sync::CancellationToken::new();
+        // One token per connection. Cancelled only on SHUTDOWN.
+        // REBORN does NOT cancel it — on_running keeps processing across restarts.
+        let shutdown_token = CancellationToken::new();
 
         loop {
             let env = tokio::time::timeout(
@@ -255,8 +266,9 @@ impl<H: ComponentHandler> Component<H> {
                     self.handle_config(writer, &env, shutdown_token.clone()).await?;
                 }
                 MessageType::Lifecycle => {
-                    if self.handle_lifecycle(writer, &env).await? {
-                        return Ok(());
+                    match self.handle_lifecycle(writer, &env, &shutdown_token).await? {
+                        LifecycleOutcome::Continue => {}
+                        LifecycleOutcome::Stop => return Ok(()),
                     }
                 }
                 MessageType::Error => {
@@ -295,7 +307,7 @@ impl<H: ComponentHandler> Component<H> {
         &self,
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
         env: &Envelope,
-        shutdown_token: tokio::sync::CancellationToken,
+        shutdown_token: CancellationToken,
     ) -> Result<()> {
         if env.command != Command::Configure {
             return Ok(());
@@ -335,29 +347,49 @@ impl<H: ComponentHandler> Component<H> {
         Ok(())
     }
 
-    /// Returns true if the loop should stop.
     async fn handle_lifecycle(
         &self,
         writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
         env: &Envelope,
-    ) -> Result<bool> {
+        shutdown_token: &CancellationToken,
+    ) -> Result<LifecycleOutcome> {
         match env.command {
+            Command::Reborn => {
+                info!("REBORN — clearing state for session restart");
+
+                // on_running keeps running — it will receive data from the
+                // new orchestrator run on the same stream socket.
+                self.handler.on_reborn().await;
+
+                self.send_ack(writer, &env.message_id).await?;
+
+                info!("REBORN complete — continuing");
+                Ok(LifecycleOutcome::Continue)
+            }
+
             Command::Shutdown => {
                 info!("Shutdown requested by Aegis");
+                shutdown_token.cancel();
                 self.send_ack(writer, &env.message_id).await?;
                 self.graceful_shutdown(writer).await;
-                return Ok(true);
+                Ok(LifecycleOutcome::Stop)
             }
-            Command::Ack => debug!("ACK received"),
-            _ => warn!("Unknown lifecycle command: {:?}", env.command),
+
+            Command::Ack => {
+                debug!("ACK received");
+                Ok(LifecycleOutcome::Continue)
+            }
+
+            _ => {
+                warn!("Unknown lifecycle command: {:?}", env.command);
+                Ok(LifecycleOutcome::Continue)
+            }
         }
-        Ok(false)
     }
 
-    /// Returns true if the error is non-recoverable.
     async fn handle_error_msg(&self, env: &Envelope) -> bool {
-        let code    = env.payload.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-        let message = env.payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let code        = env.payload.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        let message     = env.payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let recoverable = env.payload.get("recoverable").and_then(|v| v.as_bool()).unwrap_or(false);
 
         error!("Error from Aegis — code={} message={}", code, message);
@@ -418,4 +450,9 @@ impl<H: ComponentHandler> Component<H> {
     fn source(&self) -> String {
         format!("component:{}", self.cfg.component_name)
     }
+}
+
+enum LifecycleOutcome {
+    Continue,
+    Stop,
 }

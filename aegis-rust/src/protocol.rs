@@ -23,6 +23,7 @@ pub enum Command {
     Registered,
     StateUpdate,
     Shutdown,
+    Reborn,   // ← new: server-initiated session restart
     Ack,
     Nack,
     Configure,
